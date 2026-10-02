@@ -9,7 +9,7 @@ Use this command to clone the project:
 
 ```bash
 
-git clone kaloa017/QRCodeTransfer.git
+git clone github.com/kaloa017/QRCodeTransfer.git
 
 ```
 
