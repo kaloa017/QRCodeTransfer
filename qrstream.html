@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>QR Stream</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f6f5f1;--fg:#1d1d1b;--card:#fff;--mut:#6b6a66;--ac:#2f5bea;--ok:#1f9d55;--bd:#ddd9d0}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#151515;--fg:#eee;--card:#1f1f1f;--mut:#9a9a94;--ac:#6f93ff;--ok:#43c47a;--bd:#333}}
+:root[data-theme="dark"]{--bg:#151515;--fg:#eee;--card:#1f1f1f;--mut:#9a9a94;--ac:#6f93ff;--ok:#43c47a;--bd:#333}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:560px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:4px 0 12px}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+button,.btn,select{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--fg);padding:10px 14px;border-radius:10px;cursor:pointer;text-decoration:none;display:inline-block}
+button.on,button.pri{background:var(--ac);color:#fff;border-color:var(--ac)}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+label{color:var(--mut);font-size:14px}
+input[type=range]{flex:1;min-width:120px}
+canvas#qr{width:100%;max-width:420px;aspect-ratio:1;image-rendering:pixelated;background:#fff;border-radius:8px;display:block;margin:8px auto}
+video{width:100%;border-radius:10px;background:#000;max-height:45vh}
+.bar{height:10px;background:var(--bd);border-radius:6px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--ok)}
+#grid{display:flex;flex-wrap:wrap;gap:1px;margin-top:8px}#grid b{width:5px;height:5px;background:var(--bd)}#grid b.g{background:var(--ok)}
+small,.mut{color:var(--mut)}audio{width:100%;margin-top:8px}
+.hide{display:none}
+</style></head><body><main>
+<h1>QR Stream</h1>
+<div class="tabs"><button id="tS" class="on">Send</button><button id="tR">Receive</button></div>
+
+<section id="send">
+ <div class="card">
+  <input type="file" id="file">
+  <div id="mp3opts" class="hide">
+   <div class="row"><label><input type="checkbox" id="comp" checked> Compress MP3 (mono, low bitrate)</label>
+   <select id="kbps"><option value="8">8 kbps (tiny)</option><option value="16" selected>16 kbps</option><option value="24">24 kbps (better)</option></select></div>
+  </div>
+  <p class="mut" id="cinfo"></p>
+  <div class="row"><label>Speed <span id="fv">6</span> frames/s</label><input type="range" id="fps" min="1" max="15" value="6"></div>
+  <div class="row"><label>Chunk <span id="cv">300</span> bytes</label><input type="range" id="cs" min="100" max="700" step="50" value="300"></div>
+ </div>
+ <div class="card hide" id="sbox">
+  <canvas id="qr" width="10" height="10"></canvas>
+  <div class="bar"><i id="sbar"></i></div>
+  <div class="row"><span class="mut" id="sinfo"></span><button id="restart">↺ Restart</button></div>
+  <small>Tip: for live playback, press Restart right when the phone starts scanning.</small>
+ </div>
+</section>
+
+<section id="recv" class="hide">
+ <div class="card">
+  <button class="pri" id="cam">Start camera</button>
+  <video id="vid" playsinline muted class="hide"></video>
+  <p class="mut" id="rmsg">Point the camera at the sending screen.</p>
+  <div class="bar"><i id="rbar"></i></div><div id="grid"></div>
+  <div id="out"></div>
+ </div>
+</section>
+<p class="mut"><small>Everything runs in your browser. Nothing is uploaded; the file travels only through the camera.</small></p>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+function tab(s){$('send').classList.toggle('hide',!s);$('recv').classList.toggle('hide',s);$('tS').classList.toggle('on',s);$('tR').classList.toggle('on',!s);if(s)stopCam()}
+$('tS').onclick=()=>tab(true);$('tR').onclick=()=>tab(false);
+$('fps').oninput=e=>{$('fv').textContent=e.target.value;if(chunks.length)start()};
+$('cs').oninput=e=>{$('cv').textContent=e.target.value};
+$('cs').onchange=()=>{if(bytes)prepare()};
+
+/* ---------- SEND ---------- */
+let file=null,orig=null,bytes=null,outMime='',live=false,chunks=[],sid='',timer=null,ptr=0,tick=0,rc=0;
+const b64=u=>{let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s)};
+const isMp3=f=>f.type==='audio/mpeg'||/\.mp3$/i.test(f.name);
+const kb=n=>n>1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(0)+' KB';
+$('file').onchange=async e=>{
+  file=e.target.files[0];if(!file)return;orig=new Uint8Array(await file.arrayBuffer());
+  $('mp3opts').classList.toggle('hide',!isMp3(file));
+  if(isMp3(file)){setSlider('fps',10);setSlider('cs',350)}
+  load();
+};
+$('comp').onchange=$('kbps').onchange=()=>file&&load();
+function setSlider(id,v){$(id).value=v;$(id).dispatchEvent(new Event('input'))}
+async function load(){
+  clearInterval(timer);$('sbox').classList.add('hide');
+  if(isMp3(file)){
+    outMime='audio/mpeg';live=true;
+    if($('comp').checked){
+      try{bytes=await compress(orig,+$('kbps').value)}
+      catch(err){$('cinfo').textContent='Compression failed ('+err.message+'); sending original.';bytes=orig}
+    }else bytes=orig;
+    const secs=Math.ceil(bytes.length/(+$('cs').value*(+$('fps').value)*0.7));
+    $('cinfo').textContent=`${kb(orig.length)} → ${kb(bytes.length)}. Estimated send time ≈ ${Math.floor(secs/60)}m ${secs%60}s.`;
+  }else{
+    bytes=orig;outMime=file.type||'application/octet-stream';live=false;
+    $('cinfo').textContent=`${kb(bytes.length)} · will be downloadable once all chunks are received.`;
+  }
+  prepare();
+}
+async function compress(buf,kbps){
+  const sr=kbps<=8?8000:kbps<=16?11025:16000;
+  const ac=new (window.AudioContext||window.webkitAudioContext)();
+  const dec=await ac.decodeAudioData(buf.slice(0).buffer);ac.close();
+  $('cinfo').textContent='Compressing…';
+  const oc=new OfflineAudioContext(1,Math.ceil(dec.duration*sr),sr);
+  const src=oc.createBufferSource();src.buffer=dec;src.connect(oc.destination);src.start();
+  const pcm=(await oc.startRendering()).getChannelData(0);
+  const s16=new Int16Array(pcm.length);
+  for(let i=0;i<pcm.length;i++){const v=Math.max(-1,Math.min(1,pcm[i]));s16[i]=v<0?v*32768:v*32767}
+  const enc=new lamejs.Mp3Encoder(1,sr,kbps),out=[];
+  for(let i=0;i<s16.length;i+=1152){
+    const d=enc.encodeBuffer(s16.subarray(i,i+1152));if(d.length)out.push(new Uint8Array(d.buffer,d.byteOffset,d.length));
+    if(i%(1152*300)===0){$('cinfo').textContent=`Compressing… ${Math.round(i/s16.length*100)}%`;await new Promise(r=>setTimeout(r))}
+  }
+  const f=enc.flush();if(f.length)out.push(new Uint8Array(f.buffer,f.byteOffset,f.length));
+  const tot=out.reduce((a,b)=>a+b.length,0),res=new Uint8Array(tot);let o=0;for(const p of out){res.set(p,o);o+=p.length}
+  return res;
+}
+function prepare(){
+  const sz=+$('cs').value;chunks=[];
+  for(let i=0;i<bytes.length;i+=sz)chunks.push(b64(bytes.subarray(i,i+sz)));
+  sid=Math.random().toString(36).slice(2,6);start();
+}
+function start(){
+  clearInterval(timer);if(!chunks.length)return;ptr=0;tick=0;rc=0;$('sbox').classList.remove('hide');
+  timer=setInterval(frame,1000/+$('fps').value);
+}
+$('restart').onclick=()=>{sid=Math.random().toString(36).slice(2,6);start()};
+function frame(){
+  const n=chunks.length;let s;
+  if(tick++%16===0)s=`QS1|${sid}|0|${n}|${bytes.length}|${outMime}|${file.name}`;
+  else{
+    let i=ptr;
+    if(live&&ptr>1&&++rc%5===0)i=Math.max(0,ptr-1-Math.floor(Math.random()*40)); // repair resend for live mode
+    else ptr=(ptr+1)%n;
+    s=`QS1|${sid}|${i+1}|${n}|${chunks[i]}`;
+  }
+  draw(s);$('sbar').style.width=(ptr/n*100)+'%';
+  $('sinfo').textContent=`${file.name} · ${n} chunks`;
+}
+function draw(text){
+  const q=qrcode(0,'L');q.addData(text);q.make();
+  const m=q.getModuleCount(),c=$('qr'),px=6,qz=4,N=(m+qz*2)*px;
+  c.width=c.height=N;const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,N,N);g.fillStyle='#000';
+  for(let r=0;r<m;r++)for(let k=0;k<m;k++)if(q.isDark(r,k))g.fillRect((k+qz)*px,(r+qz)*px,px,px);
+}
+
+/* ---------- RECEIVE ---------- */
+let stream=null,raf=0,R=null,A=null;
+const vid=$('vid'),cv=document.createElement('canvas'),cx=cv.getContext('2d',{willReadFrequently:true});
+$('cam').onclick=async()=>{
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}}});
+    vid.srcObject=stream;vid.classList.remove('hide');await vid.play();scan();$('cam').classList.add('hide');
+  }catch(e){$('rmsg').textContent='Camera unavailable: '+e.message+'. If embedded, open the page in its own tab (HTTPS).'}
+};
+function stopCam(){cancelAnimationFrame(raf);if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}vid.classList.add('hide');$('cam').classList.remove('hide')}
+function scan(){
+  if(vid.readyState>=2){
+    const sc=Math.min(1,800/vid.videoWidth);cv.width=vid.videoWidth*sc;cv.height=vid.videoHeight*sc;cx.drawImage(vid,0,0,cv.width,cv.height);
+    const d=cx.getImageData(0,0,cv.width,cv.height),r=jsQR(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
+    if(r&&r.data.startsWith('QS1|'))handle(r.data);
+  }
+  raf=requestAnimationFrame(scan);
+}
+function handle(s){
+  const p=s.split('|'),id=p[1],i=+p[2],n=+p[3];
+  if(!R||R.id!==id){R={id,n,got:new Map(),meta:null,done:false,next:1,bytes:0,started:false};A=null;$('out').innerHTML='';$('grid').innerHTML='<b></b>'.repeat(n)}
+  if(i===0){if(!R.meta){R.meta={size:+p[4],mime:p[5],name:p.slice(6).join('|')};if(R.meta.mime==='audio/mpeg')initLive()}}
+  else if(!R.got.has(i)){
+    const bin=atob(p[4]),u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);
+    R.got.set(i,u);$('grid').children[i-1]?.classList.add('g');
+  }
+  update();
+}
+function update(){
+  const c=R.got.size;$('rbar').style.width=(c/R.n*100)+'%';
+  $('rmsg').textContent=`${R.meta?R.meta.name+' · ':''}${c}/${R.n} chunks`+(R.meta?'':' (waiting for header)');
+  if(A)pump();
+  if(!R.done&&R.meta&&c===R.n)finish();
+}
+/* live MP3 playback via MediaSource, with a blob-refresh fallback */
+function initLive(){
+  const el=document.createElement('audio');el.controls=true;$('out').prepend(el);
+  A={el,sb:null,ms:null,mse:!!(window.MediaSource&&MediaSource.isTypeSupported('audio/mpeg')),lastBlob:0};
+  if(A.mse){
+    A.ms=new MediaSource();el.src=URL.createObjectURL(A.ms);
+    A.ms.addEventListener('sourceopen',()=>{
+      A.sb=A.ms.addSourceBuffer('audio/mpeg');try{A.sb.mode='sequence'}catch(e){}
+      A.sb.addEventListener('updateend',pump);pump();
+    },{once:true});
+  }
+}
+function pump(){
+  if(!A||!R.meta)return;
+  if(A.mse){
+    if(!A.sb||A.sb.updating)return;
+    const parts=[];let len=0;
+    while(R.got.has(R.next)&&parts.length<12){const u=R.got.get(R.next++);parts.push(u);len+=u.length}
+    if(parts.length){
+      const m=new Uint8Array(len);let o=0;for(const u of parts){m.set(u,o);o+=u.length}
+      R.bytes+=len;try{A.sb.appendBuffer(m)}catch(e){}
+      if(!R.started&&R.bytes>=6000){R.started=true;A.el.play().catch(()=>{})}
+    }else if(R.next>R.n&&A.ms.readyState==='open')try{A.ms.endOfStream()}catch(e){}
+  }else{
+    let pre=0;while(R.got.has(pre+1))pre++;
+    if(pre-A.lastBlob>=20||(pre===R.n&&A.lastBlob!==pre)){
+      A.lastBlob=pre;const parts=[];for(let i=1;i<=pre;i++)parts.push(R.got.get(i));
+      const t=A.el.currentTime,pl=!A.el.paused||!R.started;R.started=true;
+      A.el.src=URL.createObjectURL(new Blob(parts,{type:'audio/mpeg'}));
+      A.el.onloadedmetadata=()=>{A.el.currentTime=t;if(pl)A.el.play().catch(()=>{})};
+    }
+  }
+}
+function finish(){
+  R.done=true;const parts=[];for(let i=1;i<=R.n;i++)parts.push(R.got.get(i));
+  const url=URL.createObjectURL(new Blob(parts,{type:R.meta.mime}));
+  const a=document.createElement('a');a.href=url;a.download=R.meta.name;a.className='btn pri';a.textContent='⬇ Download '+R.meta.name;
+  const row=document.createElement('div');row.className='row';row.appendChild(a);$('out').appendChild(row);
+  $('rmsg').textContent='Complete ✓';
+}
+</script></body></html>
