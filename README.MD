@@ -11,7 +11,7 @@ Use this command to clone the project:
 
 ```bash
 
-git clone kaloa017/QRCodeFileTransfer.git
+git clone github.com/kaloa017/QRCodeTransfer.git
 
 ```
 
@@ -32,6 +32,10 @@ python app.py
 ```
 
 Then it should be accessible via all devices on the same network via the IP in the terminal.
+
+It also should be noted that this can be accessed on the internet via GitHub Pages here:
+
+https://kaloa017.github.io/QRCodeTransfer/
 
 ## Credits
 
