@@ -5,6 +5,8 @@ It's highly inefficient, and it warms up your phone. So I wouldn't recommend usi
 
 ## Installation 
 
+_It's highly advised to use the browser version instead, hosted on GitHub Pages. This installation is only recommended if you are going to develop further on the project, and need to test certain things locally on your devices before publishing._
+
 Use this command to clone the project:
 
 ```bash

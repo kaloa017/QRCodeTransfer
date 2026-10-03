@@ -3,6 +3,10 @@
 Serves qrstream.html over HTTPS on your local network so a phone can open it
 and use the camera (browsers only allow camera access on HTTPS or localhost).
 
+note: this is mainly a testing environment. It's not recommended to use this 
+Python file unless you are developing on it. You may also encounter missing
+browser certificates.
+
 Run:  pip install -r requirements.txt && python app.py
 """
 import os
@@ -49,9 +53,31 @@ def lan_ip():
         s.close()
 
 
+def find_page():
+    """Use qrstream.html, or any similarly named .html file next to app.py
+    (browsers sometimes rename downloads, e.g. 'qrstream (1).html' or 'qrstream')."""
+    exact = os.path.join(HERE, "qrstream.html")
+    if os.path.exists(exact):
+        return exact
+    names = sorted(os.listdir(HERE))
+    for n in names:
+        if n.lower().startswith("qrstream") and os.path.isfile(os.path.join(HERE, n)):
+            return os.path.join(HERE, n)
+    for n in names:
+        if n.lower().endswith((".html", ".htm")):
+            return os.path.join(HERE, n)
+    return None
+
+
 @app.route("/")
 def index():
-    with open(os.path.join(HERE, "qrstream.html"), encoding="utf-8") as f:
+    page = find_page()
+    if not page:
+        return Response(
+            f"qrstream.html was not found in {HERE}\n"
+            "Download it again and put it in the same folder as app.py.",
+            status=404, mimetype="text/plain")
+    with open(page, encoding="utf-8") as f:
         html = f.read()
     for name, url in LIBS.items():
         if os.path.exists(os.path.join(LIB_DIR, name)):
@@ -67,6 +93,8 @@ def lib(name):
 if __name__ == "__main__":
     fetch_libs()
     ip = lan_ip()
+    page = find_page()
+    print(f"Serving page: {page}" if page else f"WARNING: no qrstream.html found in {HERE}")
     print("\nQR Stream is running.")
     print(f"  On this computer:  https://localhost:{PORT}")
     print(f"  On your phone:     https://{ip}:{PORT}   (same Wi-Fi)")

@@ -21,6 +21,9 @@ video{width:100%;border-radius:10px;background:#000;max-height:45vh}
 .bar{height:10px;background:var(--bd);border-radius:6px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--ok)}
 #grid{display:flex;flex-wrap:wrap;gap:1px;margin-top:8px}#grid b{width:5px;height:5px;background:var(--bd)}#grid b.g{background:var(--ok)}
 small,.mut{color:var(--mut)}audio{width:100%;margin-top:8px}
+input[type=text]{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--fg);padding:9px 12px;border-radius:10px;flex:1;min-width:140px}
+button.sm{padding:6px 10px;font-size:14px}
+#integ{white-space:pre-line;margin-top:8px;font-size:14px}
 .hide{display:none}
 </style></head><body><main>
 <h1>QR Stream</h1>
@@ -35,13 +38,14 @@ small,.mut{color:var(--mut)}audio{width:100%;margin-top:8px}
   </div>
   <p class="mut" id="cinfo"></p>
   <div class="row"><label>Speed <span id="fv">6</span> frames/s</label><input type="range" id="fps" min="1" max="15" value="6"></div>
-  <div class="row"><label>Chunk <span id="cv">300</span> bytes</label><input type="range" id="cs" min="100" max="700" step="50" value="300"></div>
+  <div class="row"><label>Chunk <span id="cv">400</span> bytes</label><input type="range" id="cs" min="100" max="700" step="50" value="400"></div>
  </div>
  <div class="card hide" id="sbox">
   <canvas id="qr" width="10" height="10"></canvas>
   <div class="bar"><i id="sbar"></i></div>
   <div class="row"><span class="mut" id="sinfo"></span><button id="restart">↺ Restart</button></div>
-  <small>Tip: for live playback, press Restart right when the phone starts scanning.</small>
+  <div class="row"><input type="text" id="rec" placeholder="Recovery: missing frames, e.g. 12,48,73"><button id="recGo">Recover</button></div>
+  <small>Tip: for live playback, press Restart right when the phone starts scanning. Leave the box empty and press Recover to return to the full loop.</small>
  </div>
 </section>
 
@@ -51,6 +55,9 @@ small,.mut{color:var(--mut)}audio{width:100%;margin-top:8px}
   <video id="vid" playsinline muted class="hide"></video>
   <p class="mut" id="rmsg">Point the camera at the sending screen.</p>
   <div class="bar"><i id="rbar"></i></div><div id="grid"></div>
+  <p class="mut" id="miss"></p>
+  <div class="row"><button id="copyMiss" class="sm hide">Copy missing list</button><button id="drop" class="sm hide">Discard transfer</button></div>
+  <div class="mut" id="integ"></div>
   <div id="out"></div>
  </div>
 </section>
@@ -63,19 +70,142 @@ small,.mut{color:var(--mut)}audio{width:100%;margin-top:8px}
 const $=id=>document.getElementById(id);
 function tab(s){$('send').classList.toggle('hide',!s);$('recv').classList.toggle('hide',s);$('tS').classList.toggle('on',s);$('tR').classList.toggle('on',!s);if(s)stopCam()}
 $('tS').onclick=()=>tab(true);$('tR').onclick=()=>tab(false);
-$('fps').oninput=e=>{$('fv').textContent=e.target.value;if(chunks.length)start()};
-$('cs').oninput=e=>{$('cv').textContent=e.target.value};
-$('cs').onchange=()=>{if(bytes)prepare()};
 
-/* ---------- SEND ---------- */
-let file=null,orig=null,bytes=null,outMime='',live=false,chunks=[],sid='',timer=null,ptr=0,tick=0,rc=0;
-const b64=u=>{let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s)};
+/* ===== PURE START: protocol layer (no DOM, no QR, reusable by any transport) =====
+   File → Chunker → Packet encoder … Packet decoder → Collector → Reassembler → File
+   Packet (binary):  'QS' | ver | type | transferId(4) | frameIndex(3) | totalFrames(3) | payloadLen(2) | payload | CRC32(4)
+   type 0 = data frame, type 1 = header frame (name, mime, size, SHA-256; tiny files carry their data inline). */
+const Proto=(()=>{
+  const VER=3,T_DATA=0,T_META=1,HDR=16,enc=new TextEncoder(),dec=new TextDecoder();
+  const crcT=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;crcT[n]=c>>>0}
+  const crc32=(u,s=0,e=u.length)=>{let c=0xFFFFFFFF;for(let i=s;i<e;i++)c=crcT[(c^u[i])&255]^(c>>>8);return(c^0xFFFFFFFF)>>>0};
+  const hex=u=>[...u].map(b=>b.toString(16).padStart(2,'0')).join('');
+  const sha256=async u=>new Uint8Array(await crypto.subtle.digest('SHA-256',u));
+  function pack(type,tid,idx,total,payload){
+    const out=new Uint8Array(HDR+payload.length+4),dv=new DataView(out.buffer);
+    out[0]=0x51;out[1]=0x53;out[2]=VER;out[3]=type;dv.setUint32(4,tid);
+    out[8]=idx>>>16;out[9]=idx>>>8;out[10]=idx;out[11]=total>>>16;out[12]=total>>>8;out[13]=total;
+    dv.setUint16(14,payload.length);out.set(payload,HDR);dv.setUint32(HDR+payload.length,crc32(out,0,HDR+payload.length));
+    return out;
+  }
+  function unpack(b){
+    if(b.length<2||b[0]!==0x51||b[1]!==0x53)return{err:'foreign'};
+    if(b.length<HDR+4||b[2]!==VER)return{err:'bad'};
+    const dv=new DataView(b.buffer,b.byteOffset,b.length),len=dv.getUint16(14);
+    if(HDR+len+4!==b.length||crc32(b,0,HDR+len)!==dv.getUint32(HDR+len))return{err:'bad'};
+    return{type:b[3],tid:dv.getUint32(4),idx:(b[8]<<16)|(b[9]<<8)|b[10],total:(b[11]<<16)|(b[12]<<8)|b[13],payload:b.subarray(HDR,HDR+len)};
+  }
+  function encodeMeta(m,data){
+    const nm=enc.encode(m.name).subarray(0,200),mi=enc.encode(m.mime).subarray(0,100),d=data||new Uint8Array(0);
+    const out=new Uint8Array(1+2+8+32+1+mi.length+1+nm.length+d.length),dv=new DataView(out.buffer);let o=0;
+    out[o++]=data?1:0;dv.setUint16(o,m.chunk);o+=2;dv.setFloat64(o,m.size);o+=8;out.set(m.sha,o);o+=32;
+    out[o++]=mi.length;out.set(mi,o);o+=mi.length;out[o++]=nm.length;out.set(nm,o);o+=nm.length;out.set(d,o);
+    return out;
+  }
+  function decodeMeta(p){
+    const dv=new DataView(p.buffer,p.byteOffset,p.length);let o=0;
+    const inline=p[o++]&1,chunk=dv.getUint16(o);o+=2;const size=dv.getFloat64(o);o+=8;const sha=p.slice(o,o+32);o+=32;
+    const ml=p[o++],mime=dec.decode(p.subarray(o,o+ml));o+=ml;const nl=p[o++],name=dec.decode(p.subarray(o,o+nl));o+=nl;
+    return{inline,chunk,size,sha,mime,name,data:inline?p.slice(o):null};
+  }
+  /* Chunker: small files become ONE frame (header + data); larger files are split into indexed frames. */
+  async function makePlan(bytes,{name,mime,chunk}){
+    const sha=await sha256(bytes),tid=crypto.getRandomValues(new Uint32Array(1))[0],m={name,mime,size:bytes.length,chunk,sha};
+    const inline=bytes.length+encodeMeta(m,null).length+HDR+4<=600;
+    if(inline){const mp=pack(T_META,tid,0,1,encodeMeta(m,bytes));return{tid,total:1,inline:true,meta:m,metaPacket:mp,packet:()=>mp}}
+    const total=Math.max(1,Math.ceil(bytes.length/chunk)),mp=pack(T_META,tid,0,total,encodeMeta(m,null));
+    return{tid,total,inline:false,meta:m,metaPacket:mp,packet:i=>pack(T_DATA,tid,i,total,bytes.subarray(i*chunk,(i+1)*chunk))};
+  }
+  return{HDR,T_DATA,T_META,pack,unpack,crc32,hex,sha256,encodeMeta,decodeMeta,makePlan};
+})();
+
+/* Frame collector: order-independent, duplicate-safe, CRC-checked, persisted through a store. */
+class Collector{
+  constructor(store){this.store=store;this.onreset=()=>{};this.clear()}
+  clear(){this.tid=null;this.total=0;this.frames=new Map();this.meta=null;this.bad=0;this.done=false;this.finishing=false;this.resumed=false}
+  begin(tid,total){
+    this.clear();this.tid=tid;this.total=total;this.onreset();
+    return this.store.load(tid).then(s=>{
+      if(this.tid!==tid||!s)return false;
+      for(const[i,u]of s.frames)if(!this.frames.has(i)){this.frames.set(i,u);this.resumed=true}
+      if(s.meta&&!this.meta)this.meta=s.meta;return true;
+    }).catch(()=>false);
+  }
+  ingest(bytes){
+    const p=Proto.unpack(bytes);
+    if(p.err==='foreign')return{ev:'foreign'};
+    if(p.err){this.bad++;return{ev:'bad'}}
+    const began=this.tid!==p.tid?this.begin(p.tid,p.total):null;
+    if(p.total!==this.total)return{ev:'bad',began};
+    if(p.type===Proto.T_META){
+      const m=Proto.decodeMeta(p.payload);let ev='dup',idx;
+      if(!this.meta){this.meta=m;ev='meta';this.store.putMeta(this.tid,{total:this.total,meta:{...m,data:null}})}
+      if(m.inline&&!this.frames.has(0)){this.frames.set(0,m.data);this.store.putFrame(this.tid,0,m.data);ev='new';idx=0}
+      return{ev,idx,began};
+    }
+    if(p.idx>=this.total)return{ev:'bad',began};
+    if(this.frames.has(p.idx))return{ev:'dup',began};
+    const copy=p.payload.slice();this.frames.set(p.idx,copy);this.store.putFrame(this.tid,p.idx,copy);
+    return{ev:'new',idx:p.idx,began};
+  }
+  missing(){const m=[];for(let i=0;i<this.total;i++)if(!this.frames.has(i))m.push(i);return m}
+  async assemble(){ // reassemble in order, then verify size + SHA-256 against the header
+    let len=0;for(let i=0;i<this.total;i++)len+=this.frames.get(i).length;
+    const out=new Uint8Array(len);let o=0;for(let i=0;i<this.total;i++){const f=this.frames.get(i);out.set(f,o);o+=f.length}
+    const hash=Proto.hex(await Proto.sha256(out)),sizeOk=len===this.meta.size;
+    return{bytes:out,sizeOk,shaOk:sizeOk&&hash===Proto.hex(this.meta.sha),hash};
+  }
+}
+function memStore(){
+  const T=new Map(),F=new Map();
+  return{
+    async load(tid){const t=T.get(tid),f=F.get(tid);return(t||f)?{meta:t&&t.meta,frames:f?[...f]:[]}:null},
+    putFrame(tid,i,u){if(!F.has(tid))F.set(tid,new Map());F.get(tid).set(i,u)},
+    putMeta(tid,o){T.set(tid,{tid,...o,done:false,t:Date.now()})},
+    async finish(tid){F.delete(tid);const t=T.get(tid);if(t)t.done=true},
+    async last(){let b=null;for(const t of T.values())if(!t.done&&(!b||t.t>b.t))b=t;return b},
+    async drop(tid){T.delete(tid);F.delete(tid)}
+  };
+}
+/* ===== PURE END ===== */
+
+/* Resume support: IndexedDB (falls back to memory if unavailable) */
+function idbStore(){
+  const open=()=>open.p||(open.p=new Promise((res,rej)=>{const r=indexedDB.open('qrstream',1);
+    r.onupgradeneeded=()=>{r.result.createObjectStore('transfers',{keyPath:'tid'});r.result.createObjectStore('frames')};
+    r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)}));
+  const P=q=>new Promise((res,rej)=>{q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)});
+  const run=async(names,mode,fn)=>{const d=await open(),t=d.transaction(names,mode),done=new Promise((res,rej)=>{t.oncomplete=res;t.onerror=t.onabort=()=>rej(t.error)});const out=await fn(t);await done;return out};
+  const rng=tid=>IDBKeyRange.bound(tid+':',tid+':\uffff');
+  return{
+    load:tid=>run(['transfers','frames'],'readonly',t=>Promise.all([P(t.objectStore('transfers').get(tid)),P(t.objectStore('frames').getAll(rng(tid))),P(t.objectStore('frames').getAllKeys(rng(tid)))])
+      .then(([tr,vals,keys])=>(tr||vals.length)?{meta:tr&&tr.meta,frames:keys.map((k,i)=>[+String(k).split(':')[1],vals[i]])}:null)),
+    putFrame:(tid,i,u)=>{run(['frames'],'readwrite',t=>{t.objectStore('frames').put(u,tid+':'+i)}).catch(()=>{})},
+    putMeta:(tid,o)=>{run(['transfers'],'readwrite',t=>{t.objectStore('transfers').put({tid,...o,done:false,t:Date.now()})}).catch(()=>{})},
+    finish:tid=>run(['transfers','frames'],'readwrite',t=>{t.objectStore('frames').delete(rng(tid));const s=t.objectStore('transfers');return P(s.get(tid)).then(r=>{if(r){r.done=true;s.put(r)}})}).catch(()=>{}),
+    last:()=>run(['transfers'],'readonly',t=>P(t.objectStore('transfers').getAll())).then(a=>a.filter(x=>!x.done).sort((x,y)=>y.t-x.t)[0]||null).catch(()=>null),
+    drop:tid=>run(['transfers','frames'],'readwrite',t=>{t.objectStore('transfers').delete(tid);t.objectStore('frames').delete(rng(tid))}).catch(()=>{})
+  };
+}
+const store=(()=>{try{return window.indexedDB?idbStore():memStore()}catch(e){return memStore()}})();
+
+/* ---------- helpers for the "missing frames" list (1-based, ranges allowed: 12,48,73-80) ---------- */
+function ranges(a){const o=[];for(let i=0;i<a.length;){let j=i;while(j+1<a.length&&a[j+1]===a[j]+1)j++;o.push(j>i+1?`${a[i]+1}-${a[j]+1}`:j>i?`${a[i]+1},${a[j]+1}`:`${a[i]+1}`);i=j+1}return o.join(',')}
+function parseList(s,total){const set=new Set();for(const t of s.split(/[\s,;]+/)){const m=t.match(/^(\d+)(?:-(\d+))?$/);if(!m)continue;let a=+m[1],b=m[2]?+m[2]:a;if(a>b)[a,b]=[b,a];for(let k=Math.max(1,a);k<=Math.min(total,b);k++)set.add(k-1)}return[...set].sort((x,y)=>x-y)}
+
+/* ================= SEND ================= */
+let file=null,orig=null,bytes=null,outMime='',plan=null,recList=null,timer=null,pos=0,tick=0,lastIdx=0;
+const qrCache=new Map();
 const isMp3=f=>f.type==='audio/mpeg'||/\.mp3$/i.test(f.name);
-const kb=n=>n>1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(0)+' KB';
+const kb=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>=1024?(n/1024).toFixed(0)+' KB':n+' B';
+const mmss=s=>`${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+$('fps').oninput=e=>{$('fv').textContent=e.target.value;if(plan)start()};
+$('cs').oninput=e=>{$('cv').textContent=e.target.value};
+$('cs').onchange=()=>{if(bytes)replan()};
 $('file').onchange=async e=>{
   file=e.target.files[0];if(!file)return;orig=new Uint8Array(await file.arrayBuffer());
   $('mp3opts').classList.toggle('hide',!isMp3(file));
-  if(isMp3(file)){setSlider('fps',10);setSlider('cs',350)}
+  if(isMp3(file))setSlider('fps',8);
   load();
 };
 $('comp').onchange=$('kbps').onchange=()=>file&&load();
@@ -83,18 +213,21 @@ function setSlider(id,v){$(id).value=v;$(id).dispatchEvent(new Event('input'))}
 async function load(){
   clearInterval(timer);$('sbox').classList.add('hide');
   if(isMp3(file)){
-    outMime='audio/mpeg';live=true;
+    outMime='audio/mpeg';
     if($('comp').checked){
       try{bytes=await compress(orig,+$('kbps').value)}
       catch(err){$('cinfo').textContent='Compression failed ('+err.message+'); sending original.';bytes=orig}
     }else bytes=orig;
-    const secs=Math.ceil(bytes.length/(+$('cs').value*(+$('fps').value)*0.7));
-    $('cinfo').textContent=`${kb(orig.length)} → ${kb(bytes.length)}. Estimated send time ≈ ${Math.floor(secs/60)}m ${secs%60}s.`;
-  }else{
-    bytes=orig;outMime=file.type||'application/octet-stream';live=false;
-    $('cinfo').textContent=`${kb(bytes.length)} · will be downloadable once all chunks are received.`;
-  }
-  prepare();
+  }else{bytes=orig;outMime=file.type||'application/octet-stream'}
+  await replan();
+}
+async function replan(){
+  clearInterval(timer);
+  plan=await Proto.makePlan(bytes,{name:file.name,mime:outMime,chunk:+$('cs').value});
+  qrCache.clear();recList=null;$('rec').value='';
+  const sizeTxt=isMp3(file)&&bytes!==orig?`${kb(orig.length)} → ${kb(bytes.length)}`:kb(bytes.length);
+  $('cinfo').textContent=plan.inline?`${sizeTxt} · fits in a single QR code.`:`${sizeTxt} · ${plan.total} frames · ≈ ${mmss(plan.total/(+$('fps').value))} per loop.`;
+  start();
 }
 async function compress(buf,kbps){
   const sr=kbps<=8?8000:kbps<=16?11025:16000;
@@ -115,107 +248,155 @@ async function compress(buf,kbps){
   const tot=out.reduce((a,b)=>a+b.length,0),res=new Uint8Array(tot);let o=0;for(const p of out){res.set(p,o);o+=p.length}
   return res;
 }
-function prepare(){
-  const sz=+$('cs').value;chunks=[];
-  for(let i=0;i<bytes.length;i+=sz)chunks.push(b64(bytes.subarray(i,i+sz)));
-  sid=Math.random().toString(36).slice(2,6);start();
+/* QR transport (sender side): packet bytes → QR. Binary byte mode, ECC L, 1px/module canvas scaled by CSS.
+   Rendered images are cached, so repeated loops cost nothing. */
+function qrImage(key,pk){
+  let im=qrCache.get(key);if(im)return im;
+  const q=qrcode(0,'L');q.addData(String.fromCharCode.apply(null,pk),'Byte');q.make();
+  const m=q.getModuleCount(),N=m+8,d=new Uint8ClampedArray(N*N*4).fill(255);
+  for(let r=0;r<m;r++)for(let k=0;k<m;k++)if(q.isDark(r,k)){const o=((r+4)*N+k+4)*4;d[o]=d[o+1]=d[o+2]=0}
+  im=new ImageData(d,N,N);qrCache.set(key,im);return im;
+}
+function show(key,pk){
+  const im=qrImage(key,pk),c=$('qr');if(c.width!==im.width){c.width=c.height=im.width}
+  c.getContext('2d').putImageData(im,0,0);
 }
 function start(){
-  clearInterval(timer);if(!chunks.length)return;ptr=0;tick=0;rc=0;$('sbox').classList.remove('hide');
-  timer=setInterval(frame,1000/+$('fps').value);
+  clearInterval(timer);if(!plan)return;pos=0;tick=0;$('sbox').classList.remove('hide');
+  timer=setInterval(frame,1000/+$('fps').value);frame();
 }
-$('restart').onclick=()=>{sid=Math.random().toString(36).slice(2,6);start()};
+$('restart').onclick=()=>{pos=0;tick=0};
+$('recGo').onclick=()=>{ // jump straight to chosen frames; empty box = back to the full loop
+  if(!plan)return;const l=parseList($('rec').value,plan.total);recList=l.length?l:null;pos=0;tick=0;
+};
+$('rec').onkeydown=e=>{if(e.key==='Enter')$('recGo').click()};
 function frame(){
-  const n=chunks.length;let s;
-  if(tick++%16===0)s=`QS1|${sid}|0|${n}|${bytes.length}|${outMime}|${file.name}`;
-  else{
-    let i=ptr;
-    if(live&&ptr>1&&++rc%5===0)i=Math.max(0,ptr-1-Math.floor(Math.random()*40)); // repair resend for live mode
-    else ptr=(ptr+1)%n;
-    s=`QS1|${sid}|${i+1}|${n}|${chunks[i]}`;
-  }
-  draw(s);$('sbar').style.width=(ptr/n*100)+'%';
-  $('sinfo').textContent=`${file.name} · ${n} chunks`;
-}
-function draw(text){
-  const q=qrcode(0,'L');q.addData(text);q.make();
-  const m=q.getModuleCount(),c=$('qr'),px=6,qz=4,N=(m+qz*2)*px;
-  c.width=c.height=N;const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,N,N);g.fillStyle='#000';
-  for(let r=0;r<m;r++)for(let k=0;k<m;k++)if(q.isDark(r,k))g.fillRect((k+qz)*px,(r+qz)*px,px,px);
+  if(!plan)return;
+  if(!plan.inline&&tick++%16===0){show('m',plan.metaPacket);return} // header repeats every 16 frames
+  let i;if(recList)i=recList[pos++%recList.length];else{i=pos;pos=(pos+1)%plan.total}
+  show(i,plan.packet(i));lastIdx=i;
+  $('sinfo').textContent=plan.inline?`${file.name} · single frame`:`Frame ${i+1} / ${plan.total}`+(recList?` · recovery (${recList.length})`:'');
 }
 
-/* ---------- RECEIVE ---------- */
-let stream=null,raf=0,R=null,A=null;
+/* ================= RECEIVE ================= */
+const C=new Collector(store);
+let stream=null,raf=0,A=null,L=null,audioEl=null;
+const SILENT='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
 const vid=$('vid'),cv=document.createElement('canvas'),cx=cv.getContext('2d',{willReadFrequently:true});
 $('cam').onclick=async()=>{
+  // unlock audio inside this tap so the song can start by itself later
+  if(!audioEl){audioEl=document.createElement('audio');audioEl.controls=true}
+  audioEl.src=SILENT;audioEl.play().catch(()=>{});
   try{
     stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}}});
     vid.srcObject=stream;vid.classList.remove('hide');await vid.play();scan();$('cam').classList.add('hide');
   }catch(e){$('rmsg').textContent='Camera unavailable: '+e.message+'. If embedded, open the page in its own tab (HTTPS).'}
 };
 function stopCam(){cancelAnimationFrame(raf);if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}vid.classList.add('hide');$('cam').classList.remove('hide')}
-function scan(){
+function scan(){ // QR transport (receiver side): camera → packet bytes
   if(vid.readyState>=2){
     const sc=Math.min(1,800/vid.videoWidth);cv.width=vid.videoWidth*sc;cv.height=vid.videoHeight*sc;cx.drawImage(vid,0,0,cv.width,cv.height);
     const d=cx.getImageData(0,0,cv.width,cv.height),r=jsQR(d.data,d.width,d.height,{inversionAttempts:'dontInvert'});
-    if(r&&r.data.startsWith('QS1|'))handle(r.data);
+    if(r&&r.binaryData&&r.binaryData[0]===0x51&&r.binaryData[1]===0x53)handle(Uint8Array.from(r.binaryData));
   }
   raf=requestAnimationFrame(scan);
 }
-function handle(s){
-  const p=s.split('|'),id=p[1],i=+p[2],n=+p[3];
-  if(!R||R.id!==id){R={id,n,got:new Map(),meta:null,done:false,next:1,bytes:0,started:false};A=null;$('out').innerHTML='';$('grid').innerHTML='<b></b>'.repeat(n)}
-  if(i===0){if(!R.meta){R.meta={size:+p[4],mime:p[5],name:p.slice(6).join('|')};if(R.meta.mime==='audio/mpeg')initLive()}}
-  else if(!R.got.has(i)){
-    const bin=atob(p[4]),u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);
-    R.got.set(i,u);$('grid').children[i-1]?.classList.add('g');
+C.onreset=()=>{
+  $('out').innerHTML='';$('integ').textContent='';A=null;
+  L={next:null,start:0,maxKnown:-1,bytes:0,started:false,skipped:0};
+  $('grid').innerHTML=C.total<=4000?'<b></b>'.repeat(C.total):'';
+};
+function syncGrid(){const g=$('grid').children;for(const i of C.frames.keys())if(g[i])g[i].classList.add('g')}
+function handle(bytes){
+  const r=C.ingest(bytes);
+  if(r.began)r.began.then(()=>{syncGrid();refresh()});
+  if(r.ev==='new'){
+    const g=$('grid').children[r.idx];if(g)g.classList.add('g');
+    L.maxKnown=Math.max(L.maxKnown,r.idx);if(L.next===null){L.next=r.idx<16?0:r.idx;L.start=L.next}
   }
-  update();
+  if(!A&&C.meta&&!C.resumed&&C.meta.mime==='audio/mpeg')initLive();
+  refresh();
 }
-function update(){
-  const c=R.got.size;$('rbar').style.width=(c/R.n*100)+'%';
-  $('rmsg').textContent=`${R.meta?R.meta.name+' · ':''}${c}/${R.n} chunks`+(R.meta?'':' (waiting for header)');
+function short(s){return s.length>80?s.slice(0,s.lastIndexOf(',',80))+' …':s}
+function refresh(){
+  if(C.tid===null)return;
+  const c=C.frames.size,t=C.total,miss=C.missing();
+  $('rbar').style.width=(c/t*100)+'%';
+  const b=[];if(C.meta)b.push(C.meta.name);b.push(`${c} / ${t} frames`);
+  if(C.bad)b.push(`${C.bad} failed CRC`);if(L.skipped)b.push(`${L.skipped} skipped in playback`);if(!C.meta)b.push('waiting for header');
+  if(!C.done)$('rmsg').textContent=b.join(' · ');
+  $('miss').textContent=c>0&&miss.length?'Missing: '+short(ranges(miss)):'';
+  $('copyMiss').classList.toggle('hide',!(c>0&&miss.length));
+  $('drop').classList.remove('hide');
   if(A)pump();
-  if(!R.done&&R.meta&&c===R.n)finish();
+  if(C.meta&&c===t&&!C.finishing)finish();
 }
-/* live MP3 playback via MediaSource, with a blob-refresh fallback */
+$('copyMiss').onclick=()=>{const t=ranges(C.missing());(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).catch(()=>prompt('Missing frames',t))};
+$('drop').onclick=async()=>{
+  if(C.tid!==null)await store.drop(C.tid);C.clear();A=null;L=null;
+  $('out').innerHTML='';$('grid').innerHTML='';$('integ').textContent='';$('miss').textContent='';$('rbar').style.width='0';
+  $('rmsg').textContent='Transfer discarded. Point the camera at the sending screen.';$('drop').classList.add('hide');$('copyMiss').classList.add('hide');
+  L={next:null,start:0,maxKnown:-1,bytes:0,started:false,skipped:0};
+};
+/* live MP3 playback: starts by itself after a few seconds of audio; gaps are skipped, MP3 resyncs on its own */
 function initLive(){
-  const el=document.createElement('audio');el.controls=true;$('out').prepend(el);
-  A={el,sb:null,ms:null,mse:!!(window.MediaSource&&MediaSource.isTypeSupported('audio/mpeg')),lastBlob:0};
+  const el=audioEl||(audioEl=document.createElement('audio'));el.controls=true;$('out').prepend(el);
+  A={el,sb:null,ms:null,mse:!!(window.MediaSource&&MediaSource.isTypeSupported('audio/mpeg')),last:0};
   if(A.mse){
     A.ms=new MediaSource();el.src=URL.createObjectURL(A.ms);
     A.ms.addEventListener('sourceopen',()=>{
       A.sb=A.ms.addSourceBuffer('audio/mpeg');try{A.sb.mode='sequence'}catch(e){}
       A.sb.addEventListener('updateend',pump);pump();
     },{once:true});
-  }
+  }else{el.removeAttribute('src')}
 }
 function pump(){
-  if(!A||!R.meta)return;
+  if(!A||L.next===null)return;
   if(A.mse){
     if(!A.sb||A.sb.updating)return;
     const parts=[];let len=0;
-    while(R.got.has(R.next)&&parts.length<12){const u=R.got.get(R.next++);parts.push(u);len+=u.length}
+    while(L.next<C.total&&parts.length<12){
+      if(C.frames.has(L.next)){const u=C.frames.get(L.next++);parts.push(u);len+=u.length}
+      else if(L.maxKnown-L.next>=8){L.next++;L.skipped++}
+      else break;
+    }
     if(parts.length){
       const m=new Uint8Array(len);let o=0;for(const u of parts){m.set(u,o);o+=u.length}
-      R.bytes+=len;try{A.sb.appendBuffer(m)}catch(e){}
-      if(!R.started&&R.bytes>=6000){R.started=true;A.el.play().catch(()=>{})}
-    }else if(R.next>R.n&&A.ms.readyState==='open')try{A.ms.endOfStream()}catch(e){}
-  }else{
-    let pre=0;while(R.got.has(pre+1))pre++;
-    if(pre-A.lastBlob>=20||(pre===R.n&&A.lastBlob!==pre)){
-      A.lastBlob=pre;const parts=[];for(let i=1;i<=pre;i++)parts.push(R.got.get(i));
-      const t=A.el.currentTime,pl=!A.el.paused||!R.started;R.started=true;
-      A.el.src=URL.createObjectURL(new Blob(parts,{type:'audio/mpeg'}));
+      L.bytes+=len;try{A.sb.appendBuffer(m)}catch(e){}
+      if(!L.started&&L.bytes>=6000){L.started=true;A.el.play().catch(()=>{})}
+    }else if(L.next>=C.total&&A.ms.readyState==='open')try{A.ms.endOfStream()}catch(e){}
+  }else{ // browsers without MediaSource for mp3: refresh a blob every ~20 new frames
+    const keys=[...C.frames.keys()].filter(k=>k>=L.start).sort((a,b)=>a-b);
+    if(keys.length-A.last>=20){
+      A.last=keys.length;const t=A.el.currentTime,pl=!A.el.paused||!L.started;L.started=true;
+      A.el.src=URL.createObjectURL(new Blob(keys.map(k=>C.frames.get(k)),{type:'audio/mpeg'}));
       A.el.onloadedmetadata=()=>{A.el.currentTime=t;if(pl)A.el.play().catch(()=>{})};
     }
   }
 }
-function finish(){
-  R.done=true;const parts=[];for(let i=1;i<=R.n;i++)parts.push(R.got.get(i));
-  const url=URL.createObjectURL(new Blob(parts,{type:R.meta.mime}));
-  const a=document.createElement('a');a.href=url;a.download=R.meta.name;a.className='btn pri';a.textContent='⬇ Download '+R.meta.name;
+async function finish(){
+  C.finishing=true;
+  const lines=['✓ All frames received','✓ File reconstructed'];
+  $('integ').textContent=lines.join('\n')+'\n… verifying SHA-256';
+  const r=await C.assemble();
+  if(!r.shaOk){
+    $('integ').textContent=lines[0]+'\n✗ '+(r.sizeOk?'SHA-256 mismatch':'Size mismatch')+' — file is NOT trustworthy. Discard and scan again.';
+    $('rmsg').textContent='Integrity check failed';return;
+  }
+  C.done=true;store.finish(C.tid);
+  $('integ').textContent=lines.join('\n')+'\n✓ SHA-256 verified\nTransfer complete';
+  $('rmsg').textContent=`${C.meta.name} · ${C.total} / ${C.total} frames · complete`;
+  $('miss').textContent='';$('copyMiss').classList.add('hide');
+  const url=URL.createObjectURL(new Blob([r.bytes],{type:C.meta.mime}));
+  const a=document.createElement('a');a.href=url;a.download=C.meta.name;a.className='btn';a.textContent='⬇ Download '+C.meta.name;
   const row=document.createElement('div');row.className='row';row.appendChild(a);$('out').appendChild(row);
-  $('rmsg').textContent='Complete ✓';
+  if(C.meta.mime.startsWith('audio/')&&!(A&&L.started)){ // not streamed live (other formats / resumed): play the verified file automatically
+    const el=audioEl||(audioEl=document.createElement('audio'));el.controls=true;el.src=url;$('out').prepend(el);el.play().catch(()=>{});
+  }
 }
+/* pick up an interrupted transfer after a reload / pause */
+store.last().then(t=>{
+  if(!t||C.tid!==null)return;
+  C.begin(t.tid,t.total).then(ok=>{if(ok){syncGrid();refresh();if(!C.done)$('rmsg').textContent='Resumed: '+$('rmsg').textContent}});
+}).catch(()=>{});
 </script></body></html>
